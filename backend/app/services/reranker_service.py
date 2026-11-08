@@ -1,75 +1,68 @@
-import os
+from threading import Lock
 
-import cohere
-from dotenv import load_dotenv
+from FlagEmbedding import FlagReranker
 
 
-load_dotenv()
+MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+_reranker = None
+_reranker_lock = Lock()
 
-co = cohere.ClientV2(COHERE_API_KEY)
-reranker_calls = 0
+
+def _get_reranker() -> FlagReranker:
+    """Load the reranker once and reuse it for subsequent requests."""
+    global _reranker
+
+    if _reranker is None:
+        with _reranker_lock:
+            # Check again after acquiring the lock so concurrent first
+            # requests do not load multiple copies of the model.
+            if _reranker is None:
+                print(f"Loading local reranker: {MODEL_NAME}")
+                _reranker = FlagReranker(
+                    MODEL_NAME,
+                    use_fp16=False,  # CPU-compatible; use_fp16=True with supported GPU
+                )
+                print("Local BGE reranker loaded.")
+
+    return _reranker
+
 
 def rerank_documents(question: str, documents, top_n: int = 3):
-    texts = [doc.page_content for doc in documents]
-    print("🔄 Cohere reranking started...")
-    global reranker_calls
-    reranker_calls += 1
-    print(f"💰 Reranker API calls: {reranker_calls}")
-    response = co.rerank(
-        model="rerank-v4.0-fast",
-        query=question,
-        documents=texts,
-        top_n=top_n,
-    )
-    print("✅ Cohere reranking completed.")
+    """
+    Rerank LangChain Documents locally with a cross-encoder.
 
-    for result in response.results:
-        print(
-            f"RERANK RESULT → index={result.index}, "
-            f"score={result.relevance_score}"
-        )
+    Returns the selected original Document objects and their reranker scores,
+    preserving metadata and document identity for downstream citations.
+    """
+    if not documents or top_n <= 0:
+        return [], []
 
-    reranked_documents = [
-    documents[result.index]
-    for result in response.results
+    reranker = _get_reranker()
+    pairs = [
+        [question, document.page_content]
+        for document in documents
     ]
 
-    scores = [
-        result.relevance_score
-        for result in response.results
-    ]
+    print("Reranking documents with local BGE cross-encoder...")
+    scores = reranker.compute_score(pairs, normalize=True)
 
-    return reranked_documents, scores
-    # return [
-    #     documents[result.index]
-    #     for result in response.results
-    # ]
+    # FlagEmbedding normally returns a list for a list of pairs. Normalize
+    # the single-result case as well to keep the return type consistent.
+    if isinstance(scores, (int, float)):
+        scores = [scores]
 
-# def rerank_documents(question: str, documents, top_n: int = 3):
-#     texts = [
-#         doc.page_content
-#         for doc in documents
-#     ]
+    ranked_results = sorted(
+        zip(documents, scores),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:top_n]
 
-#     response = co.rerank(
-#         model="rerank-v4.0-fast",
-#         query=question,
-#         documents=texts,
-#         top_n=top_n,
-#     )
+    reranked_documents = [document for document, _ in ranked_results]
+    rerank_scores = [float(score) for _, score in ranked_results]
 
-#     reranked_documents = []
+    for rank, (document, score) in enumerate(ranked_results, start=1):
+        print(f"RERANK RESULT -> rank={rank}, score={score:.4f}")
 
-#     for result in response.results:
-#         document = documents[result.index]
-
-#         reranked_documents.append(
-#             (
-#                 document,
-#                 result.relevance_score,
-#             )
-#         )
-
-#     return reranked_documents
+    print("Local BGE reranking completed.")
+    return reranked_documents, rerank_scores
