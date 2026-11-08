@@ -11,3 +11,4 @@ langchain-tavily
 langchain-qdrant
 pypdf
 beautifulsoup4
+FlagEmbedding
